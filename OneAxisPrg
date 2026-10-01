@@ -1,0 +1,338 @@
+#include <SD.h>
+
+// ==================== НАСТРОЙКИ ====================
+#define STEP_Axis_OUT      4
+#define DIR_Axis_PIN       5
+#define EN_Axis_PIN        7
+#define SD_CS              10
+#define STACK_SIZE         8
+#define ACCEL_STEPS        442
+#define MAX_ACCEL          64
+#define MIN_FREQ           1000
+#define STEPS_PER_MM       400.0
+
+// ==================== СТРУКТУРЫ ====================
+struct CmdCell {
+    long Axis;
+    int F;
+    bool busy;
+    bool reverse;
+};
+// ==================== EEPROM ====================
+const uint8_t speedTable[64] PROGMEM = {
+     0,  3, 3, 3, 3, 3, 4, 4,
+    4, 4, 4, 5, 5, 5, 6, 6,
+    6, 6, 7, 7, 7, 8, 8, 9,
+    9, 10, 10, 11, 11, 12, 12, 13,
+    14, 14, 15, 16, 17, 17, 18, 19,
+    20, 21, 22, 24, 25, 26, 27, 29,
+    30, 32, 34, 35, 37, 39, 41, 43,
+    45, 48, 50, 53, 55, 58, 61, 64
+};
+
+// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+CmdCell stack[STACK_SIZE];
+int stackCursor = 0;
+int stackHead = 0;
+int stackCount = 0;
+long lastX = 0;
+File file;
+String Axis_Name = "X";
+
+volatile long Cur_Axis = 0;
+volatile long stepsToGo = 0;
+volatile int DIR_Axis = 1;
+
+
+volatile int stepCounter = 0;
+volatile float currentFreq = 1000;
+volatile float targetFreq = 1000;
+
+volatile long totalSteps = 0;
+volatile int feedRate = 100;
+
+// ==================== ПРОТОТИПЫ ====================
+int parseF(String cmd);
+long parse_str(String cmd, String Axis);
+
+void stackInit();
+bool stackIsEmpty();
+bool stackIsFull();
+bool stackPush(long axis, int f);
+bool stackPeek(long *axis, int *f, bool *reverse);
+bool stackPeekAt(int index, long *axis, int *f);
+void stackNext();
+int stackGetCursor();
+
+void readNextCommand();
+
+void setupTimer();
+void startTimer();
+void stopTimer();
+
+void setFeedRate(int F);
+void moveTo(long target);
+
+// ==================== ПАРСЕР ====================
+int parseF(String cmd) {
+    int idx = cmd.indexOf('F');
+    if (idx == -1) return -1;
+    return atoi(cmd.substring(idx + 1).c_str());
+}
+
+long parse_str(String cmd, String Axis) {
+    int idx = cmd.indexOf(Axis);
+    if (idx == -1) return -1;
+    return atol(cmd.substring(idx + 1).c_str());
+}
+
+// ==================== СТЕК ====================
+void stackInit() {
+    for (int i = 0; i < STACK_SIZE; i++) {
+        stack[i].Axis = 0;
+        stack[i].F = 0;
+        stack[i].busy = false;
+        stack[i].reverse = false;
+		
+		
+    }
+    stackCursor = 0;
+    stackHead = 0;
+	stackCount = 0;
+    lastX = 0;
+}
+bool stackIsEmpty() {
+    return (stackCount == 0);
+}
+
+bool stackIsFull() {
+    return (stackCount == STACK_SIZE);
+}
+// Положить в стек (из файла)
+bool stackPush(long axis, int f) {
+    if (stackIsFull()) return false;
+    
+    int idx = stackHead;
+	stackCount++;
+    stack[idx].Axis = axis;
+    stack[idx].F = f;
+    stack[idx].busy = true;
+    stack[idx].reverse = false;
+    // Проверка разворота для предыдущей
+    if (stackHead != stackCursor) {
+        int prevIdx = (stackHead - 1 + STACK_SIZE) % STACK_SIZE;
+        if (stack[prevIdx].busy) {
+            long prevX = stack[prevIdx].Axis;
+            if ((prevX > lastX && axis < prevX) || (prevX < lastX && axis > prevX)) {
+                stack[prevIdx].reverse = true;
+            }
+        }
+    }
+    
+    lastX = axis;
+    stackHead = (stackHead + 1) % STACK_SIZE;
+    return true;
+}
+// Взять текущую (не удаляя)
+bool stackPeek(long *axis, int *f, bool *reverse) {
+    if (stackIsEmpty()) return false;
+    *axis = stack[stackCursor].Axis;
+    *f = stack[stackCursor].F;
+    *reverse = stack[stackCursor].reverse;
+    return true;
+}
+// Посмотреть любой по индексу
+bool stackPeekAt(int index, long *axis, int *f) {
+    if (index < 0 || index >= STACK_SIZE) return false;
+    if (!stack[index].busy) return false;
+    *axis = stack[index].Axis;
+    *f = stack[index].F;
+    return true;
+}
+// Сдвинуть курсор (удалить текущую)
+void stackNext() {
+    if (stackIsEmpty()) return;
+    stack[stackCursor].busy = false;
+    stackCursor = (stackCursor + 1) % STACK_SIZE;
+	stackCount--;
+}
+// Текущий индекс (только для чтения, не для записи)
+int stackGetCursor() {
+    return stackCursor;
+}
+
+// ==================== ЧТЕНИЕ С SD ====================
+void readNextCommand() {
+    if (!file.available()) return;
+    if (!stackIsFull()) {
+		String cmd = file.readStringUntil('\n');
+		if (cmd == "") return;
+    
+		int fr = parseF(cmd);
+		long axis = parse_str(cmd, Axis_Name);
+    
+		if (axis != -1) {
+        stackPush(axis, fr > 0 ? fr : 0);
+    }
+	}
+}
+
+// ==================== ТАЙМЕР ====================
+void setupTimer() {
+    noInterrupts();
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TCNT1 = 0;
+    OCR1A = 24000;
+    TCCR1B |= (1 << WGM12);
+    TCCR1B |= (1 << CS10);
+    TIMSK1 |= (1 << OCIE1A);
+    interrupts();
+}
+
+void stopTimer() {
+    TCCR1B &= ~(1 << CS10);
+    digitalWrite(EN_Axis_PIN, HIGH);
+}
+
+void startTimer() {
+    digitalWrite(EN_Axis_PIN, LOW);
+    TCNT1 = 0;
+    TCCR1B |= (1 << CS10);
+}
+
+// ==================== ПРЕРЫВАНИЕ ====================
+ISR(TIMER1_COMPA_vect) {
+    if (stepsToGo == 0) {
+        stopTimer();
+        return;
+    }
+
+    PORTD |= (1 << PD4);
+    __builtin_avr_delay_cycles(32);
+    PORTD &= ~(1 << PD4);
+
+    stepsToGo--;
+    Cur_Axis += DIR_Axis;
+    stepCounter++;
+
+    if (stepCounter >= 5) {
+        stepCounter = 0;
+        
+        if (totalSteps == 0) return;
+        
+        long progress = totalSteps - stepsToGo;
+        int idx;
+        if (accelSteps < 1) accelSteps = 1;
+        if (progress < accelSteps) {
+            idx = (progress * 63) / accelSteps;
+        } else if (stepsToGo < accelSteps) {
+            idx = ((accelSteps - stepsToGo) * 63) / accelSteps;
+            idx = 63 - idx;
+        } else {
+            idx = 63;
+        }
+        
+        if (idx < 0) idx = 0;
+        if (idx > 63) idx = 63;
+        
+        int percent = pgm_read_byte(&speedTable[idx]);
+        float stepFreq = (float)targetFreq * percent / 100.0;
+        if (stepFreq < minFreq) stepFreq = minFreq;
+        
+        if (currentFreq < stepFreq) {
+            currentFreq += max_Accel;
+            if (currentFreq > stepFreq) currentFreq = stepFreq;
+        } else if (currentFreq > stepFreq) {
+            currentFreq -= max_Accel;
+            if (currentFreq < stepFreq) currentFreq = stepFreq;
+        }
+        
+        unsigned long ocr = (16000000.0 / currentFreq) - 1;
+        if (ocr > 65535) ocr = 65535;
+        if (ocr < 10) ocr = 10;
+        OCR1A = (unsigned int)ocr;
+    }
+}
+
+
+// ==================== ДВИЖЕНИЕ ====================
+void setFeedRate(int F) {
+    feedRate = F;
+}
+
+void moveTo(long target) {
+    long diff = target - Cur_Axis;
+	
+    if (diff > 0) {
+        digitalWrite(DIR_Axis_PIN, LOW);
+        DIR_Axis = 1;
+    } else {
+        digitalWrite(DIR_Axis_PIN, HIGH);
+        DIR_Axis = -1;
+        diff = -diff;
+    }
+
+    stepsToGo = diff;
+    totalSteps =diff;
+	if (totalSteps != 0) {
+   
+
+    targetFreq = (float)feedRate * stepsPerMM / 60.0;
+    currentFreq = minFreq;
+    //stepsToBrake = (targetFreq - minFreq) / max_Accel * 20;
+    stepCounter = 0;
+    digitalWrite(EN_Axis_PIN, LOW);
+	
+    startTimer();
+	}
+}
+
+// ==================== SETUP ====================
+void setup() {
+	pinMode(EN_Axis_PIN, OUTPUT);
+	digitalWrite(EN_Axis_PIN, HIGH);
+    Serial.begin(9600);
+    pinMode(STEP_Axis_OUT, OUTPUT);
+    pinMode(DIR_Axis_PIN, OUTPUT);
+    
+    
+    
+    stackInit();
+    setupTimer();
+
+    if (!SD.begin(SD_CS)) {
+        Serial.println("SD card error");
+        return;
+    }
+    Serial.println("SD card ready");
+
+    file = SD.open("move.txt");
+    if (!file) {
+        Serial.println("File open error");
+        return;
+    }
+}
+
+// ==================== LOOP ====================
+void loop() {
+    readNextCommand();
+    
+    if (stepsToGo == 0 && !stackIsEmpty()) {
+        long axis;
+        int f;
+        bool rev;
+
+        if (stackPeek(&axis, &f, &rev)) {
+            if (f > 0) setFeedRate(f);
+            if (axis != Cur_Axis) {
+                moveTo(axis);
+            }
+            stackNext();
+        }
+    }
+
+    if (stackIsEmpty() && !file.available()) {
+        digitalWrite(EN_Axis_PIN, HIGH);
+    }
+}
